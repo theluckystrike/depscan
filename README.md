@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/yunaremaia/depscan/actions/workflows/ci.yml/badge.svg)](https://github.com/yunaremaia/depscan/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Stars](https://img.shields.io/github/stars/yunaremaia/depscan)](https://github.com/yunaremaia/depscan)
 
 Scan dependencies across multiple ecosystems with typosquat detection.
 
@@ -196,6 +196,17 @@ pytest
 pytest --cov=depscan
 ```
 
+If this tool is useful to you, a star helps other people find it.
+
+## Related tools
+
+- **[driftcheck](https://github.com/yunaremaia/driftcheck)** — detect version drift between docs and toolchain files
+- **[taintrace](https://github.com/yunaremaia/taintrace)** — trace and inspect AI agent execution
+- **[license-drift](https://github.com/yunaremaia/license-drift)** — detect license drift across a monorepo
+- **[agentcost](https://github.com/yunaremaia/agentcost)** — track and attribute LLM spend per agent
+
+Part of a family of focused, single-purpose developer tools — each one does one thing
+and does it well.
 ## Contributing
 
 Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
