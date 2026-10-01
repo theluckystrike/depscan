@@ -1,10 +1,19 @@
 """Multi-ecosystem dependency scanner."""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
+import fnmatch
 import json
+import os
 import re
 import subprocess
 import warnings
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -39,14 +48,54 @@ def validate_package_name(name: str, ecosystem: str = "") -> None:
 
 LOCK_PATTERNS = [
     "Cargo.lock",
+    "Cargo.toml",
     "package-lock.json",
+    "package.json",
     "Pipfile.lock",
     "requirements.txt",
     "go.mod",
+    "go.sum",
     "poetry.lock",
+    "pyproject.toml",
     "Gemfile.lock",
     "*.lock",
 ]
+
+DEFAULT_SKIP_DIRS = {
+    "node_modules", ".git", "__pycache__", "venv", ".venv", "env",
+    ".env", "dist", "build", "target", "vendor", ".idea", ".vscode",
+    ".tox", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+}
+
+# PEP 508 environment markers.  A requirement is only treated as carrying a
+# marker when the left-hand side of the comparison is one of these names.
+ENVIRONMENT_MARKERS = frozenset({
+    "os_name",
+    "sys_platform",
+    "platform_release",
+    "platform_system",
+    "platform_version",
+    "platform_machine",
+    "platform_python_implementation",
+    "implementation_name",
+    "implementation_version",
+    "python_version",
+    "python_full_version",
+    "platform_python_version",
+    "extra",
+})
+
+# A PEP 508 marker expression, in either ``<var> <op> <value>`` or
+# ``<value> in <var>`` order.  The variable must be a known environment marker.
+_ENV_MARKER_RE = re.compile(
+    r"^(?:[A-Za-z_][A-Za-z0-9_]*\s*(?:==|!=|<=|>=|~=|<|>|not\s+in|in)\s*.+"
+    r"|.+\s+(?:not\s+in|in)\s+[A-Za-z_][A-Za-z0-9_]*)$"
+)
+_ENV_MARKER_VARS = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# ``"<value>" in <var>`` and ``<var> in "<value>"`` forms.
+_ENV_MARKER_IN_RE = re.compile(
+    r"^(?:.+)\s+(?:not\s+in|in)\s+(?:\"[^\"]*\"|'[^']*'|[A-Za-z0-9._-]+)$"
+)
 
 
 @dataclass
@@ -72,6 +121,10 @@ class Dependency:
     known_vulnerabilities: list[Vulnerability] = field(default_factory=list)
     is_typosquat: bool = False
     typosquat_target: str = ""
+    is_orphaned: bool = False
+
+    source: str = "registry"
+    is_local: bool = False
 
     @property
     def is_vulnerable(self) -> bool:
@@ -87,15 +140,25 @@ class DependencyParser:
         deps = []
         current = {}
         in_package = False
+
+        def append_current() -> None:
+            if not current.get("name"):
+                return
+            raw_source = current.get("source", "")
+            is_local = not raw_source or raw_source.startswith("path+file://") or raw_source == "workspace"
+            source = raw_source or "local"
+            deps.append(Dependency(
+                name=current.get("name", ""),
+                version=current.get("version", ""),
+                ecosystem="cargo",
+                source=source,
+                is_local=is_local,
+            ))
+
         for line in content.splitlines():
             line = line.strip()
             if line == "[[package]]":
-                if current.get("name"):
-                    deps.append(Dependency(
-                        name=current.get("name", ""),
-                        version=current.get("version", ""),
-                        ecosystem="cargo",
-                    ))
+                append_current()
                 current = {}
                 in_package = True
                 continue
@@ -103,14 +166,91 @@ class DependencyParser:
                 key, _, value = line.partition("=")
                 key = key.strip().strip('"')
                 value = value.strip().strip('"')
-                if key in ("name", "version"):
+                if key in ("name", "version", "source"):
                     current[key] = value
-        if current.get("name"):
-            deps.append(Dependency(
-                name=current.get("name", ""),
-                version=current.get("version", ""),
-                ecosystem="cargo",
-            ))
+        append_current()
+        return deps
+
+    @staticmethod
+    def parse_cargo_toml(content: str) -> list[Dependency]:
+        """Parse dependency declarations from Cargo.toml."""
+        try:
+            data = tomllib.loads(content)
+        except (tomllib.TOMLDecodeError, TypeError):
+            return []
+
+        deps: list[Dependency] = []
+        for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+            section_data = data.get(section)
+            if not isinstance(section_data, dict):
+                continue
+            for name, spec in section_data.items():
+                version = ""
+                if isinstance(spec, str):
+                    version = spec
+                elif isinstance(spec, dict):
+                    if spec.get("workspace") is True:
+                        version = "workspace"
+                    elif isinstance(spec.get("version"), str):
+                        version = spec["version"]
+                if version:
+                    deps.append(Dependency(
+                        name=name,
+                        version=version,
+                        ecosystem="cargo",
+                    ))
+        return deps
+
+    @staticmethod
+    def parse_pyproject_toml(content: str) -> list[Dependency]:
+        """Parse PEP 621 and Poetry dependency declarations."""
+        try:
+            data = tomllib.loads(content)
+        except (tomllib.TOMLDecodeError, TypeError):
+            return []
+
+        deps: list[Dependency] = []
+        seen: set[tuple[str, str]] = set()
+
+        def add_pep508(requirement: str) -> None:
+            requirement = requirement.split(";", 1)[0].strip()
+            match = re.match(r"^([A-Za-z0-9_.-]+)(?:\[[^\]]+\])?\s*(.*)$", requirement)
+            if not match:
+                return
+            name, version = match.groups()
+            key = (name, version)
+            if key not in seen:
+                seen.add(key)
+                deps.append(Dependency(name=name, version=version, ecosystem="pypi"))
+
+        project = data.get("project", {})
+        if isinstance(project, dict):
+            dependencies = project.get("dependencies", [])
+            if isinstance(dependencies, list):
+                for requirement in dependencies:
+                    if isinstance(requirement, str):
+                        add_pep508(requirement)
+            optional = project.get("optional-dependencies", {})
+            if isinstance(optional, dict):
+                for group in optional.values():
+                    if isinstance(group, list):
+                        for requirement in group:
+                            if isinstance(requirement, str):
+                                add_pep508(requirement)
+
+        tool = data.get("tool", {})
+        poetry = tool.get("poetry", {}) if isinstance(tool, dict) else {}
+        poetry_deps = poetry.get("dependencies", {}) if isinstance(poetry, dict) else {}
+        if isinstance(poetry_deps, dict):
+            for name, spec in poetry_deps.items():
+                if name.lower() == "python":
+                    continue
+                version = spec if isinstance(spec, str) else spec.get("version", "") if isinstance(spec, dict) else ""
+                if isinstance(version, str) and version:
+                    key = (name, version)
+                    if key not in seen:
+                        seen.add(key)
+                        deps.append(Dependency(name=name, version=version, ecosystem="pypi"))
         return deps
 
     @staticmethod
@@ -189,6 +329,38 @@ class DependencyParser:
         return deps
 
     @staticmethod
+    def parse_package_json(content: str) -> list[Dependency]:
+        """Parse top-level npm dependencies from package.json."""
+        deps: list[Dependency] = []
+        try:
+            data = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            return deps
+        if not isinstance(data, dict):
+            return deps
+
+        seen: set[str] = set()
+        for section in ("dependencies", "devDependencies"):
+            section_data = data.get(section)
+            if not isinstance(section_data, dict):
+                continue
+            for name, version in section_data.items():
+                if (
+                    isinstance(name, str)
+                    and isinstance(version, str)
+                    and name
+                    and version
+                    and name not in seen
+                ):
+                    seen.add(name)
+                    deps.append(Dependency(
+                        name=name,
+                        version=version,
+                        ecosystem="npm",
+                    ))
+        return deps
+
+    @staticmethod
     def parse_pipfile_lock(content: str) -> list[Dependency]:
         """Parse Pipfile.lock JSON format."""
         deps = []
@@ -222,12 +394,40 @@ class DependencyParser:
     parse_plfile_lock = parse_pipfile_lock
 
     @staticmethod
+    def _strip_environment_marker(line: str) -> str:
+        """Drop a trailing PEP 508 environment marker from a requirement.
+
+        The marker is only removed when the text before the ``;`` is already a
+        well-formed requirement.  If the leading part still contains characters
+        that are illegal in a distribution name, the line is left untouched so
+        that :func:`validate_package_name` rejects it rather than seeing a
+        silently sanitised name.
+        """
+        if ";" not in line:
+            return line
+        head, _, tail = line.partition(";")
+        head = head.strip()
+        tail = tail.strip()
+        if not tail:
+            return head
+        if not re.match(r"^[A-Za-z0-9._-]+(?:\[[^\]]*\])?.*$", head) or \
+                re.search(r"[^A-Za-z0-9._\[\]<>!=~-]", head.split("[")[0]):
+            return line
+        if not (_ENV_MARKER_RE.match(tail) or _ENV_MARKER_IN_RE.match(tail)):
+            return line
+        # Require at least one known environment marker variable in the
+        # expression; otherwise this is not a marker we should trust.
+        if not any(v in ENVIRONMENT_MARKERS for v in _ENV_MARKER_VARS.findall(tail)):
+            return line
+        return head
+
+    @staticmethod
     def parse_requirements_txt(content: str) -> list[Dependency]:
         """Parse requirements.txt."""
         deps = []
         version_specifiers = ("==", ">=", "<=", "!=", "~=", ">", "<")
         for line in content.splitlines():
-            line = line.strip()
+            line = DependencyParser._strip_environment_marker(line.strip())
             if not line or line.startswith("#"):
                 continue
             found = False
@@ -235,7 +435,9 @@ class DependencyParser:
                 if spec in line:
                     name, _, version = line.partition(spec)
                     deps.append(Dependency(
-                        name=name.strip(),
+                        # Strip bracketed extras so typosquat detection compares
+                        # the underlying distribution name.
+                        name=name.partition("[")[0].strip(),
                         version=version.strip(),
                         ecosystem="pypi",
                     ))
@@ -244,12 +446,11 @@ class DependencyParser:
             if not found:
                 # Plain package name without version specifier
                 deps.append(Dependency(
-                    name=line.strip(),
+                    name=line.partition("[")[0].strip(),
                     version="",
                     ecosystem="pypi",
                 ))
         return deps
-
     @staticmethod
     def parse_go_mod(content: str) -> list[Dependency]:
         """Parse go.mod require and replace directives."""
@@ -359,6 +560,34 @@ class DependencyParser:
             if dep.name in replacements:
                 dep.version = replacements[dep.name]
 
+        return deps
+
+    @staticmethod
+    def parse_go_sum(content: str) -> list[Dependency]:
+        """Parse exact module versions from go.sum, deduplicating /go.mod hashes."""
+        deps: list[Dependency] = []
+        seen: set[tuple[str, str]] = set()
+        for raw_line in content.splitlines():
+            parts = raw_line.strip().split()
+            if len(parts) != 3:
+                continue
+            name, version, checksum = parts
+            if not checksum.startswith("h1:"):
+                continue
+            if version.endswith("/go.mod"):
+                version = version[:-7]
+            version = version.lstrip("v")
+            key = (name, version)
+            if key in seen:
+                continue
+            seen.add(key)
+            deps.append(Dependency(
+                name=name,
+                version=version,
+                ecosystem="go",
+                source_file="go.sum",
+                is_orphaned=True,
+            ))
         return deps
 
     @staticmethod
@@ -486,66 +715,169 @@ class MultiScanner:
         content = Path(filepath).read_text(encoding="utf-8", errors="replace")
         path = Path(filepath)
 
-        suffix_map = {
-            ".toml": ("cargo", self.parser.parse_cargo_lock),
-            ".json": ("npm", self.parser.parse_package_lock),
-            ".txt": ("pypi", self.parser.parse_requirements_txt),
-            ".mod": ("go", self.parser.parse_go_mod),
-        }
-
         # Try by filename
         filename = path.name.lower()
+        deps: list[Dependency] = []
         if "cargo.lock" in filename:
             deps = self.parser.parse_cargo_lock(content)
+        elif filename == "cargo.toml":
+            deps = self.parser.parse_cargo_toml(content)
         elif "package-lock" in filename:
             deps = self.parser.parse_package_lock(content)
+        elif filename == "package.json":
+            deps = self.parser.parse_package_json(content)
         elif "pipfile.lock" in filename:
             deps = self.parser.parse_pipfile_lock(content)
         elif "requirements" in filename:
             deps = self.parser.parse_requirements_txt(content)
         elif filename == "go.mod":
             deps = self.parser.parse_go_mod(content)
+            for dep in deps:
+                dep.source_file = str(path)
+        elif filename == "go.sum":
+            deps = self.parser.parse_go_sum(content)
+            for dep in deps:
+                dep.source_file = str(path)
         elif "poetry.lock" in filename:
             deps = self.parser.parse_poetry_lock(content)
+        elif filename == "pyproject.toml":
+            deps = self.parser.parse_pyproject_toml(content)
         elif "gemfile.lock" in filename:
             deps = self.parser.parse_gemfile_lock(content)
-        else:
-            deps = []
+
         return self._validated(deps)
 
-    def scan_directory(self, root: str = ".") -> list[Dependency]:
-        """Scan all dependency files in a directory."""
-        deps = []
-        seen = set()
+    def _discover_dependency_files(
+        self,
+        root: str,
+        excludes: set[str] | None = None,
+        include_hidden: bool = False,
+        respect_ignores: bool = True,
+        exclude_patterns: list[str] | None = None,
+    ) -> list[Path]:
+        """Return the unique dependency files below *root*, in walk order.
 
-        for pattern in LOCK_PATTERNS:
-            for path in Path(root).rglob(pattern):
-                if path.is_file():
-                    resolved = path.resolve()
-                    if resolved in seen:
-                        continue
-                    seen.add(resolved)
-                    deps.extend(self.scan_file(str(path)))
+        Prunes dependency caches, virtual environments, VCS metadata and build
+        output (unless ``include_hidden``), and honours ``.gitignore`` /
+        ``.npmignore`` rules plus any caller-supplied patterns.
+        """
+        from depscan.ignore import is_ignored, load_ignore_patterns
 
+        root_path = Path(root).resolve()
+        skip_dirs = set(DEFAULT_SKIP_DIRS)
+        if include_hidden:
+            skip_dirs = {name for name in skip_dirs if not name.startswith(".")}
+        skip_dirs.update(excludes or ())
+
+        patterns = load_ignore_patterns(root_path) if respect_ignores else []
+        patterns = list(patterns) + list(exclude_patterns or [])
+
+        files: list[Path] = []
+        seen: set[Path] = set()
+        for current_root, dirnames, filenames in os.walk(root_path):
+            dirnames[:] = [
+                name
+                for name in dirnames
+                if not any(fnmatch.fnmatch(name, pattern) for pattern in skip_dirs)
+                and (include_hidden or not name.startswith("."))
+            ]
+            for filename in sorted(filenames):
+                if not any(fnmatch.fnmatch(filename, pattern) for pattern in LOCK_PATTERNS):
+                    continue
+                path = Path(current_root) / filename
+                if patterns and is_ignored(path, root_path, patterns):
+                    continue
+                resolved = path.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                files.append(path)
+        return files
+
+    def _parse_all(self, paths: list[Path]) -> list[Dependency]:
+        """Parse discovered files, skipping unreadable ones, then mark go.sum orphans."""
+        deps: list[Dependency] = []
+        for path in paths:
+            try:
+                deps.extend(self.scan_file(str(path)))
+            except OSError as exc:
+                warnings.warn(
+                    f"Skipping unreadable dependency file {path}: {exc}",
+                    RuntimeWarning,
+                )
+
+        go_mod_names = {
+            (Path(dep.source_file).parent, dep.name)
+            for dep in deps
+            if Path(dep.source_file).name == "go.mod"
+        }
+        for dep in deps:
+            if Path(dep.source_file).name == "go.sum":
+                dep.is_orphaned = (
+                    Path(dep.source_file).parent, dep.name
+                ) not in go_mod_names
         return deps
+
+    def scan_directory(
+        self,
+        root: str = ".",
+        excludes: set[str] | None = None,
+        include_hidden: bool = False,
+        respect_ignores: bool = True,
+        exclude_patterns: list[str] | None = None,
+    ) -> list[Dependency]:
+        """Scan all dependency files in a directory."""
+        return self._parse_all(self._discover_dependency_files(
+            root,
+            excludes=excludes,
+            include_hidden=include_hidden,
+            respect_ignores=respect_ignores,
+            exclude_patterns=exclude_patterns,
+        ))
+
+    def scan_directory_parallel(
+        self,
+        root: str = ".",
+        max_workers: int = 4,
+        excludes: set[str] | None = None,
+        include_hidden: bool = False,
+        respect_ignores: bool = True,
+        exclude_patterns: list[str] | None = None,
+    ) -> list[Dependency]:
+        """Scan dependency files concurrently while preserving discovery order."""
+        paths = self._discover_dependency_files(
+            root,
+            excludes=excludes,
+            include_hidden=include_hidden,
+            respect_ignores=respect_ignores,
+            exclude_patterns=exclude_patterns,
+        )
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            parsed = executor.map(lambda path: self.scan_file(str(path)), paths)
+            return [dep for file_deps in parsed for dep in file_deps]
 
     def check_typosquat(self, dep: Dependency) -> bool:
         """Check if a dependency name is a potential typosquat."""
+        if dep.is_local:
+            return False
         name_lower = dep.name.lower()
         for target in self._typosquat_targets:
             if name_lower == target:
                 return False  # Known good package
             # Simple similarity check
-            if self._levenshtein(name_lower, target) <= 2:
+            if self._levenshtein(name_lower, target, max_distance=2) <= 2:
                 dep.is_typosquat = True
                 dep.typosquat_target = target
                 return True
         return False
 
-    def _levenshtein(self, s1: str, s2: str) -> int:
+    @lru_cache(maxsize=1024)
+    def _levenshtein(self, s1: str, s2: str, max_distance: int | None = None) -> int:
         """Calculate Levenshtein edit distance."""
+        if max_distance is not None and abs(len(s1) - len(s2)) > max_distance:
+            return max_distance + 1
         if len(s1) < len(s2):
-            return self._levenshtein(s2, s1)
+            return self._levenshtein(s2, s1, max_distance=max_distance)
         if len(s2) == 0:
             return len(s1)
         prev_row = range(len(s2) + 1)
@@ -556,16 +888,43 @@ class MultiScanner:
                 deletions = curr_row[j] + 1
                 substitutions = prev_row[j] + (c1 != c2)
                 curr_row.append(min(insertions, deletions, substitutions))
+            if max_distance is not None and min(curr_row) > max_distance:
+                return max_distance + 1
             prev_row = curr_row
         return prev_row[-1]
 
-    def scan_and_check(self, root: str = ".") -> dict:
+    def scan_and_check(
+        self,
+        root: str = ".",
+        parallel: bool = True,
+        max_workers: int = 4,
+        excludes: set[str] | None = None,
+        include_hidden: bool = False,
+        respect_ignores: bool = True,
+        exclude_patterns: list[str] | None = None,
+    ) -> dict:
         """Full scan with typosquat detection."""
-        deps = self.scan_directory(root)
+        deps = (
+            self.scan_directory_parallel(
+                root,
+                max_workers=max_workers,
+                excludes=excludes,
+                include_hidden=include_hidden,
+                respect_ignores=respect_ignores,
+                exclude_patterns=exclude_patterns,
+            )
+            if parallel
+            else self.scan_directory(
+                root,
+                excludes=excludes,
+                include_hidden=include_hidden,
+                respect_ignores=respect_ignores,
+                exclude_patterns=exclude_patterns,
+            )
+        )
         results = {
             "total": len(deps),
             "typosquats": [],
-            "vulnerable": [],
             "by_ecosystem": {},
         }
 

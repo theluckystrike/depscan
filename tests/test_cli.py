@@ -2,11 +2,13 @@
 import json
 import subprocess
 from pathlib import Path
+from unittest.mock import patch
 
 from click.testing import CliRunner
 
 from depscan import __version__
-from depscan.cli import cli
+from depscan.cli import cli, _should_fail
+from depscan.scanner import Dependency, MultiScanner
 
 
 def run_depscan(*args, cwd=None):
@@ -69,3 +71,87 @@ def test_info_shows_version_and_output_formats():
     assert "JSON" in result.output
     assert "Markdown" in result.output
     assert "SARIF" in result.output
+
+
+
+def test_list_deps_json_includes_source_file():
+    dependency = Dependency(
+        name="requests",
+        version="2.31.0",
+        ecosystem="pypi",
+        source_file="requirements.txt",
+    )
+    with patch.object(MultiScanner, "scan_directory", return_value=[dependency]):
+        result = CliRunner().invoke(cli, ["list-deps", "--json-output", "."])
+
+    assert result.exit_code == 0
+    assert json.loads(result.output) == [{
+        "name": "requests",
+        "version": "2.31.0",
+        "ecosystem": "pypi",
+        "source_file": "requirements.txt",
+    }]
+
+
+
+def test_init_creates_valid_relaxed_config(tmp_path):
+    config_path = tmp_path / ".depscan.yml"
+    runner = CliRunner()
+
+    created = runner.invoke(cli, ["init", str(config_path)])
+    validated = runner.invoke(cli, ["validate", str(config_path)])
+
+    assert created.exit_code == 0
+    assert validated.exit_code == 0
+    assert "output_format: text" in config_path.read_text()
+
+
+
+def test_init_profiles_and_force(tmp_path):
+    config_path = tmp_path / ".depscan.yml"
+    runner = CliRunner()
+
+    first = runner.invoke(cli, ["init", str(config_path), "--profile", "strict"])
+    duplicate = runner.invoke(cli, ["init", str(config_path), "--profile", "ci"])
+    forced = runner.invoke(
+        cli, ["init", str(config_path), "--profile", "ci", "--force"]
+    )
+
+    assert first.exit_code == 0
+    assert duplicate.exit_code != 0
+    assert forced.exit_code == 0
+    assert "output_format: sarif" in config_path.read_text()
+
+
+
+def test_ci_exits_one_for_typosquat():
+    dep = Dependency(name="reqests", version="1.0", ecosystem="pypi")
+    dep.typosquat_target = "requests"
+    results = {"total": 1, "typosquats": [dep], "vulnerable": [], "by_ecosystem": {"pypi": 1}}
+    with patch.object(MultiScanner, "scan_and_check", return_value=results):
+        result = CliRunner().invoke(cli, ["ci", "."])
+    assert result.exit_code == 1
+    assert "TYPOSQUAT" in result.output
+
+
+
+def test_ci_allow_known_ignores_vulnerabilities():
+    dep = Dependency(name="package", version="1.0", ecosystem="npm")
+    results = {"total": 1, "typosquats": [], "vulnerable": [dep], "by_ecosystem": {"npm": 1}}
+    with patch.object(MultiScanner, "scan_and_check", return_value=results):
+        result = CliRunner().invoke(cli, ["ci", ".", "--allow-known"])
+    assert result.exit_code == 0
+    assert "No blocking dependency findings" in result.output
+
+
+
+def test_fail_on_policies():
+    typo = {"typosquats": [object()], "vulnerable": []}
+    vulnerable = {"typosquats": [], "vulnerable": [object()]}
+    both = {"typosquats": [object()], "vulnerable": [object()]}
+
+    assert _should_fail(typo, None) is False
+    assert _should_fail(typo, "typosquat") is True
+    assert _should_fail(typo, "vulnerable") is False
+    assert _should_fail(vulnerable, "vulnerable") is True
+    assert _should_fail(both, "any") is True

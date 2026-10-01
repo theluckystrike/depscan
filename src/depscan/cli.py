@@ -19,6 +19,18 @@ import re as _re
 
 console = Console(safe_box=True)
 
+def _should_fail(results: dict, fail_on: str | None) -> bool:
+    """Return whether the selected finding policy should fail the command."""
+    if fail_on is None:
+        return False
+    has_typosquats = bool(results.get("typosquats"))
+    has_vulnerabilities = bool(results.get("vulnerable"))
+    if fail_on == "typosquat":
+        return has_typosquats
+    if fail_on == "vulnerable":
+        return has_vulnerabilities
+    return has_typosquats or has_vulnerabilities
+
 
 def _truncate(text: str, length: int = 40) -> str:
     """Truncate text with ellipsis."""
@@ -48,7 +60,35 @@ def cli():
 @click.option("--typosquat/--no-typosquat", default=True, help="Check for typosquats")
 @click.option("--strict", is_flag=True,
               help="Fail instead of skipping invalid dependency names")
-def scan(path, json_out, markdown_out, output_format, typosquat, strict):
+@click.option(
+    "--safe-output/--unsafe-output",
+    default=True,
+    help="Escape HTML in Markdown output (enabled by default)",
+)
+@click.option("--include-hidden", is_flag=True, help="Scan hidden directories")
+@click.option("--exclude", "exclude_dirs", multiple=True,
+              help="Additional directory name or glob to skip")
+@click.option("--ignore/--no-ignore", "respect_ignores", default=True,
+              help="Respect .gitignore and .npmignore files")
+@click.option("--exclude-pattern", "exclude_patterns", multiple=True,
+              help="Additional path pattern to exclude")
+@click.option("--parallel/--no-parallel", default=True,
+              help="Parse dependency files concurrently")
+@click.option("--max-workers", type=click.IntRange(min=1), default=4, show_default=True,
+              help="Worker count for parallel parsing")
+@click.option("--severity", help="Comma-separated severities to include")
+@click.option("--ecosystem", help="Comma-separated ecosystems to include")
+@click.option("--min-severity", type=click.Choice(["low", "medium", "high", "critical"]))
+@click.option(
+    "--fail-on",
+    type=click.Choice(["typosquat", "vulnerable", "any"]),
+    help="Exit 1 when selected findings are present",
+)
+def scan(
+    path, json_out, markdown_out, output_format, typosquat, strict, safe_output,
+    include_hidden, exclude_dirs, respect_ignores, exclude_patterns,
+    parallel, max_workers, severity, ecosystem, min_severity, fail_on,
+):
     """Scan a directory for dependencies."""
     scanner = MultiScanner(strict=strict)
 
@@ -58,14 +98,45 @@ def scan(path, json_out, markdown_out, output_format, typosquat, strict):
     if markdown_out and output_format == "text":
         output_format = "markdown"
 
+    def run_scan():
+        return scanner.scan_and_check(
+            path,
+            parallel=parallel,
+            max_workers=max_workers,
+            excludes=set(exclude_dirs),
+            include_hidden=include_hidden,
+            respect_ignores=respect_ignores,
+            exclude_patterns=list(exclude_patterns),
+        )
+
+    def apply_filters(results):
+        from depscan.filters import filter_results
+        severities = (
+            {value.strip().lower() for value in severity.split(",") if value.strip()}
+            if severity else None
+        )
+        ecosystems = (
+            {value.strip().lower() for value in ecosystem.split(",") if value.strip()}
+            if ecosystem else None
+        )
+        return filter_results(
+            results,
+            severities=severities,
+            ecosystems=ecosystems,
+            min_severity=min_severity,
+        )
+
+    def should_fail(results) -> bool:
+        return _should_fail(results, fail_on)
+
     # SARIF output: scan then emit SARIF 2.1.0 to stdout — no progress spinner
     # so the output can be piped directly to a file.
     if output_format == "sarif":
-        results = scanner.scan_and_check(path)
+        results = apply_filters(run_scan())
         findings = findings_from_scan_results(results)
         sarif_doc = to_sarif(findings, repo_root=path)
         click.echo(json.dumps(sarif_doc, indent=2))
-        if results.get("typosquats") or results.get("vulnerable"):
+        if should_fail(results):
             sys.exit(1)
         return
 
@@ -74,7 +145,7 @@ def scan(path, json_out, markdown_out, output_format, typosquat, strict):
         old_stdout = sys.stdout
         sys.stdout = io.StringIO()
         try:
-            results = scanner.scan_and_check(path)
+            results = apply_filters(run_scan())
         finally:
             sys.stdout = old_stdout
 
@@ -85,10 +156,26 @@ def scan(path, json_out, markdown_out, output_format, typosquat, strict):
                 {"name": d.name, "version": d.version, "target": d.typosquat_target}
                 for d in results["typosquats"]
             ],
+            "vulnerabilities": [
+                {
+                    "name": dep.name,
+                    "version": dep.version,
+                    "ecosystem": dep.ecosystem,
+                    "cves": [
+                        {
+                            "id": vulnerability.id,
+                            "severity": vulnerability.severity,
+                            "description": vulnerability.description,
+                        }
+                        for vulnerability in dep.known_vulnerabilities
+                    ],
+                }
+                for dep in results.get("vulnerable", [])
+            ],
             "by_ecosystem": results["by_ecosystem"],
         }
         print(json.dumps(output, indent=2))
-        if results["typosquats"]:
+        if should_fail(results):
             sys.exit(1)
         return
 
@@ -98,13 +185,13 @@ def scan(path, json_out, markdown_out, output_format, typosquat, strict):
         console=console,
     ) as progress:
         task = progress.add_task(f"Scanning {path}...", total=None)
-        results = scanner.scan_and_check(path)
+        results = apply_filters(run_scan())
         progress.update(task, completed=True)
 
     if output_format == "markdown":
-        formatter = MarkdownFormatter()
+        formatter = MarkdownFormatter(safe_output=safe_output)
         click.echo(formatter.format_full(results))
-        if results["typosquats"]:
+        if should_fail(results):
             sys.exit(1)
         return
 
@@ -143,6 +230,9 @@ def scan(path, json_out, markdown_out, output_format, typosquat, strict):
 
         console.print(eco_table)
 
+    if should_fail(results):
+        raise click.exceptions.Exit(1)
+
 
 @cli.command()
 @click.argument("path", default=".", type=click.Path(exists=True))
@@ -154,7 +244,12 @@ def list_deps(path, json_out):
 
     if json_out:
         output = [
-            {"name": d.name, "version": d.version, "ecosystem": d.ecosystem}
+            {
+                "name": d.name,
+                "version": d.version,
+                "ecosystem": d.ecosystem,
+                "source_file": d.source_file,
+            }
             for d in deps
         ]
         click.echo(json.dumps(output, indent=2))
@@ -179,29 +274,75 @@ def list_deps(path, json_out):
 @cli.command()
 @click.argument("path", default=".", type=click.Path(exists=True))
 @click.option(
-    "--format",
-    "sbom_format",
-    type=click.Choice(["cyclonedx", "spdx"]),
-    default="cyclonedx",
-    show_default=True,
+    "--allow-known",
+    is_flag=True,
+    help="Do not fail for known vulnerabilities; typosquats still fail",
 )
-@click.option("--output", type=click.Path(dir_okay=False), help="Write SBOM to a file")
-def sbom(path, sbom_format, output):
-    """Generate a CycloneDX or SPDX software bill of materials."""
-    from depscan.sbom import dumps, to_cyclonedx, to_spdx
+@click.option("--sarif", "sarif_out", is_flag=True, help="Emit SARIF 2.1.0")
+def ci(path, allow_known, sarif_out):
+    """Enforce dependency security in CI."""
+    scanner = MultiScanner()
+    results = scanner.scan_and_check(path)
 
-    dependencies = MultiScanner().scan_directory(path)
-    document = (
-        to_cyclonedx(dependencies)
-        if sbom_format == "cyclonedx"
-        else to_spdx(dependencies)
-    )
-    rendered = dumps(document)
-    if output:
-        Path(output).write_text(rendered + "\n", encoding="utf-8")
-        click.echo(f"Wrote {sbom_format} SBOM to {output}")
+    if sarif_out:
+        findings = findings_from_scan_results(results)
+        click.echo(json.dumps(to_sarif(findings, repo_root=path), indent=2))
     else:
-        click.echo(rendered)
+        for dep in results.get("typosquats", []):
+            click.echo(
+                f"TYPOSQUAT: {dep.name} resembles {dep.typosquat_target}",
+                err=True,
+            )
+        if not allow_known:
+            for dep in results.get("vulnerable", []):
+                click.echo(
+                    f"VULNERABLE: {dep.name}@{dep.version}",
+                    err=True,
+                )
+
+    has_findings = bool(results.get("typosquats"))
+    if not allow_known:
+        has_findings = has_findings or bool(results.get("vulnerable"))
+    if has_findings:
+        raise click.exceptions.Exit(1)
+    click.echo("No blocking dependency findings", err=not sarif_out)
+
+
+@cli.command()
+@click.argument("path", default=".", type=click.Path(exists=True, file_okay=False))
+@click.option("--write", is_flag=True, help="Create or replace the known-good manifest")
+def verify(path, write):
+    """Create or verify SHA256 lockfile integrity data."""
+    from depscan.integrity import verify_manifest, write_manifest
+
+    root = Path(path).resolve()
+    if write:
+        from depscan.scanner import LOCK_PATTERNS
+
+        files = []
+        seen = set()
+        for pattern in LOCK_PATTERNS:
+            for lockfile in root.rglob(pattern):
+                resolved = lockfile.resolve()
+                if lockfile.is_file() and resolved not in seen:
+                    seen.add(resolved)
+                    files.append(lockfile)
+        target = write_manifest(root, files)
+        click.echo(f"Wrote integrity manifest: {target}")
+        return
+    try:
+        violations = verify_manifest(root)
+    except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    if violations:
+        for violation in violations:
+            click.echo(
+                f"INTEGRITY FAILURE: {violation.file} "
+                f"(expected {violation.expected}, got {violation.actual or 'missing'})",
+                err=True,
+            )
+        raise click.exceptions.Exit(2)
+    click.echo("Lockfile integrity verified")
 
 
 @cli.command()
@@ -236,6 +377,34 @@ def check(name, version):
 
 
 @cli.command()
+@click.argument("path", default=".", type=click.Path(exists=True))
+@click.option(
+    "--format",
+    "sbom_format",
+    type=click.Choice(["cyclonedx", "spdx"]),
+    default="cyclonedx",
+    show_default=True,
+)
+@click.option("--output", type=click.Path(dir_okay=False), help="Write SBOM to a file")
+def sbom(path, sbom_format, output):
+    """Generate a CycloneDX or SPDX software bill of materials."""
+    from depscan.sbom import dumps, to_cyclonedx, to_spdx
+
+    dependencies = MultiScanner().scan_directory(path)
+    document = (
+        to_cyclonedx(dependencies)
+        if sbom_format == "cyclonedx"
+        else to_spdx(dependencies)
+    )
+    rendered = dumps(document)
+    if output:
+        Path(output).write_text(rendered + "\n", encoding="utf-8")
+        click.echo(f"Wrote {sbom_format} SBOM to {output}")
+    else:
+        click.echo(rendered)
+
+
+@cli.command()
 def info():
     """Show supported ecosystems and formats."""
     from depscan import __version__
@@ -258,3 +427,42 @@ def info():
         "• JSON output for automation",
         title="depscan — Info"
     ))
+
+
+@cli.command(name="init")
+@click.argument("path", default=".depscan.yml", type=click.Path())
+@click.option(
+    "--profile",
+    type=click.Choice(["strict", "relaxed", "ci"]),
+    default="relaxed",
+    show_default=True,
+)
+@click.option("--force", is_flag=True, help="Overwrite an existing configuration")
+def init_config(path, profile, force):
+    """Create a starter .depscan.yml configuration."""
+    from depscan.config import render_profile
+
+    config_path = Path(path)
+    if config_path.exists() and not force:
+        raise click.ClickException(
+            f"{config_path} already exists; use --force to overwrite it"
+        )
+    config_path.write_text(render_profile(profile), encoding="utf-8")
+    click.echo(f"Created {config_path} with the {profile} profile")
+
+
+@cli.command()
+@click.argument(
+    "path",
+    default=".depscan.yml",
+    type=click.Path(exists=True, dir_okay=False),
+)
+def validate(path):
+    """Validate a depscan configuration file."""
+    from depscan.config import load_config
+
+    try:
+        load_config(path)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(f"{path} is valid")
