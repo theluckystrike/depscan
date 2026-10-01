@@ -1,5 +1,9 @@
 # depscan — Multi-ecosystem Dependency Scanner
 
+[![CI](https://github.com/yunaremaia/depscan/actions/workflows/ci.yml/badge.svg)](https://github.com/yunaremaia/depscan/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Scan dependencies across multiple ecosystems with typosquat detection.
 
 ## Features
