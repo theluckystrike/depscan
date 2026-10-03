@@ -10,7 +10,7 @@
       "version": { "type": "string", "description": "Pinned version from the lockfile or manifest." },
       "ecosystem": {
         "type": "string",
-        "enum": ["cargo", "npm", "pypi"],
+        "enum": ["cargo", "go", "npm", "pypi", "rubygems"],
         "description": "Ecosystem the dependency was parsed from."
       }
     },
