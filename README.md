@@ -159,7 +159,7 @@ Fields:
   - `name` — the dependency name as written in the manifest
   - `version` — pinned version of the dependency
   - `target` — the well-known package name it appears to imitate
-- `by_ecosystem` (object) — dependency count per ecosystem (`cargo`, `npm`, `pypi`)
+- `by_ecosystem` (object) — dependency count per ecosystem (`cargo`, `go`, `npm`, `pypi`, `rubygems`)
 
 ### `depscan list-deps --json-output`
 
@@ -179,7 +179,7 @@ Fields:
 
 - `name` — dependency name
 - `version` — pinned version from the lockfile or manifest
-- `ecosystem` — one of `cargo`, `npm`, `pypi`
+- `ecosystem` — one of `cargo`, `go`, `npm`, `pypi`, `rubygems`
 
 ### Validating output
 

@@ -25,7 +25,7 @@
     "by_ecosystem": {
       "type": "object",
       "additionalProperties": { "type": "integer", "minimum": 0 },
-      "description": "Dependency count per ecosystem (cargo, npm, pypi)."
+      "description": "Dependency count per ecosystem (cargo, go, npm, pypi, rubygems)."
     }
   },
   "required": ["total", "typosquats", "by_ecosystem"]
