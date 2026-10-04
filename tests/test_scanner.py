@@ -654,10 +654,10 @@ exclude (
         scanner = MultiScanner()
         scan_file = scanner.scan_file
 
-        def read_or_fail(path):
+        def read_or_fail(path, *args):
             if Path(path) == bad:
                 raise PermissionError("denied")
-            return scan_file(path)
+            return scan_file(path, *args)
 
         with patch.object(scanner, "scan_file", side_effect=read_or_fail):
             with pytest.warns(RuntimeWarning, match="Skipping unreadable"):
@@ -1557,3 +1557,207 @@ class TestPackageNameValidation:
             # package name must appear in the argument list
             assert "lodash" in args[0]
         assert result == {"vulnerabilities": {}}
+
+
+def test_parse_cargo_toml_target_specific_sections():
+    content = '''
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winuser"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = "0.28"
+
+[target.x86_64-unknown-linux-gnu.build-dependencies]
+pkg-config = "0.3"
+'''
+    deps = DependencyParser.parse_cargo_toml(content)
+    assert {(dep.name, dep.version) for dep in deps} == {
+        ("winapi", "0.3"),
+        ("nix", "0.28"),
+        ("pkg-config", "0.3"),
+    }
+
+
+def test_parse_cargo_toml_workspace_dependencies_and_inheritance():
+    content = '''
+[workspace]
+members = ["crates/*"]
+
+[workspace.dependencies]
+serde = { version = "1.0.200", features = ["derive"] }
+anyhow = "1.0"
+
+[dependencies]
+serde = { workspace = true, optional = true }
+log = { version = "0.4", optional = true }
+'''
+    deps = DependencyParser.parse_cargo_toml(content)
+    assert sorted((dep.name, dep.version) for dep in deps) == [
+        ("anyhow", "1.0"),
+        ("log", "0.4"),
+        ("serde", "1.0.200"),
+    ]
+
+
+def test_scan_file_resolves_workspace_versions_from_root_manifest(tmp_path):
+    (tmp_path / "Cargo.toml").write_text(
+        '[workspace]\nmembers = ["crates/app"]\n\n'
+        '[workspace.dependencies]\n'
+        'serde = { version = "1.0.200", features = ["derive"] }\n'
+        'anyhow = "1.0"\n'
+    )
+    member = tmp_path / "crates" / "app"
+    member.mkdir(parents=True)
+    (member / "Cargo.toml").write_text(
+        '[package]\nname = "app"\nversion = "0.1.0"\n\n'
+        '[dependencies]\n'
+        'anyhow.workspace = true\n'
+        'serde = { workspace = true, features = ["rc"] }\n'
+        'missing = { workspace = true }\n'
+    )
+    deps = MultiScanner().scan_file(str(member / "Cargo.toml"))
+    assert {(dep.name, dep.version) for dep in deps} == {
+        ("anyhow", "1.0"),
+        ("serde", "1.0.200"),
+        ("missing", "workspace"),
+    }
+
+
+def test_parse_cargo_toml_reports_each_name_and_version_once():
+    content = """
+[dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = { version = "0.2" }
+"""
+    deps = DependencyParser.parse_cargo_toml(content)
+    assert [(dep.name, dep.version) for dep in deps] == [("libc", "0.2")]
+
+
+@pytest.mark.parametrize("workspace_deps", [[["serde", "1.0"]], "notadict", 42])
+def test_parse_cargo_toml_ignores_non_dict_workspace_deps(workspace_deps):
+    deps = DependencyParser.parse_cargo_toml(
+        '[dependencies]\nserde = { workspace = true }\n', workspace_deps
+    )
+    assert [(dep.name, dep.version) for dep in deps] == [("serde", "workspace")]
+
+
+def test_scan_directory_counts_inherited_workspace_dependencies_once(tmp_path):
+    (tmp_path / "Cargo.toml").write_text(
+        '[workspace]\nmembers = ["crates/*"]\n\n'
+        '[workspace.dependencies]\nserde = "1.0.200"\n'
+    )
+    for index in range(5):
+        member = tmp_path / "crates" / f"c{index}"
+        member.mkdir(parents=True)
+        (member / "Cargo.toml").write_text(
+            f'[package]\nname = "c{index}"\nversion = "0.1.0"\n\n'
+            '[dependencies]\nserde = { workspace = true }\n'
+        )
+    deps = MultiScanner().scan_directory(str(tmp_path))
+    assert [(dep.name, dep.version) for dep in deps] == [("serde", "1.0.200")]
+
+
+def test_cargo_workspace_lookup_stops_at_the_scan_root(tmp_path):
+    (tmp_path / "Cargo.toml").write_text(
+        '[workspace]\n\n[workspace.dependencies]\nsneaky = "9.9.9"\n'
+    )
+    scanned = tmp_path / "unrelated" / "sub"
+    scanned.mkdir(parents=True)
+    (scanned / "Cargo.toml").write_text('[dependencies]\nsneaky = { workspace = true }\n')
+    deps = MultiScanner().scan_directory(str(scanned))
+    assert [(dep.name, dep.version) for dep in deps] == [("sneaky", "workspace")]
+
+
+def test_cargo_workspace_lookup_skips_a_workspace_that_excludes_the_package(tmp_path):
+    (tmp_path / "Cargo.toml").write_text(
+        '[workspace]\nmembers = ["crates/app"]\nexclude = ["crates/orphan"]\n\n'
+        '[workspace.dependencies]\nserde = "1.0.200"\n'
+    )
+    orphan = tmp_path / "crates" / "orphan"
+    orphan.mkdir(parents=True)
+    (orphan / "Cargo.toml").write_text('[dependencies]\nserde = { workspace = true }\n')
+    deps = MultiScanner().scan_file(str(orphan / "Cargo.toml"))
+    assert [(dep.name, dep.version) for dep in deps] == [("serde", "workspace")]
+
+
+def test_cargo_manifest_without_workspace_keys_skips_the_ancestor_lookup(tmp_path):
+    manifest = tmp_path / "Cargo.toml"
+    manifest.write_text('[dependencies]\nserde = "1.0"\n')
+    with patch("depscan.scanner._cargo_workspace_root") as lookup:
+        deps = MultiScanner().scan_file(str(manifest))
+    lookup.assert_not_called()
+    assert [(dep.name, dep.version) for dep in deps] == [("serde", "1.0")]
+
+
+def _cargo_workspace(base, root_manifest, crates):
+    """Write a workspace root plus member crates that inherit serde."""
+    base.mkdir(parents=True, exist_ok=True)
+    (base / "Cargo.toml").write_text(
+        root_manifest + '\n[workspace.dependencies]\nserde = "1.0.190"\n'
+    )
+    for rel, extra in crates.items():
+        crate = base / rel
+        crate.mkdir(parents=True, exist_ok=True)
+        (crate / "Cargo.toml").write_text(
+            f'[package]\nname = "{crate.name}"\nversion = "0.1.0"\n\n'
+            '[dependencies]\nserde = { workspace = true }\n' + extra
+        )
+
+
+# Expected versions were checked against `cargo metadata --no-deps` (cargo 1.96).
+@pytest.mark.parametrize("root_manifest, crates, probe, expected", [
+    ('[workspace]\nmembers = ["crates/*"]\nexclude = ["crates/foo"]\n',
+     {"crates/app": "", "crates/foo": ""}, "crates/foo", "workspace"),
+    ('[workspace]\nmembers = ["crates/*"]\nexclude = ["crates/foo/"]\n',
+     {"crates/foo": ""}, "crates/foo", "workspace"),
+    ('[workspace]\nmembers = ["a/b/*"]\nexclude = ["a/b/c"]\n',
+     {"a/b/c": "", "a/b/d": ""}, "a/b/c", "workspace"),
+    ('[workspace]\nmembers = ["a/b/*"]\nexclude = ["a/b/c"]\n',
+     {"a/b/c": "", "a/b/d": ""}, "a/b/d", "1.0.190"),
+    ('[workspace]\nmembers = ["crates/foo"]\nexclude = ["crates/foo"]\n',
+     {"crates/foo": "", "crates/bar": ""}, "crates/foo", "1.0.190"),
+    ('[workspace]\nmembers = ["crates/foo"]\nexclude = ["crates/foo"]\n',
+     {"crates/foo": "", "crates/bar": ""}, "crates/bar", "workspace"),
+    ('[workspace]\nexclude = ["crates/foo"]\n\n[package]\nname = "root"\nversion = "0.1.0"\n',
+     {"crates/foo": "", "crates/bar": ""}, "crates/bar", "workspace"),
+    ('[workspace]\nmembers = ["crates/app"]\n',
+     {"crates/app": "", "crates/stray": ""}, "crates/stray", "workspace"),
+    ('[workspace]\nmembers = ["crates/app"]\n',
+     {"crates/app": 'lib = { path = "../lib" }\n', "crates/lib": ""}, "crates/lib", "1.0.190"),
+    ('[workspace]\nmembers = ["crates/*", "crates/gone"]\n',
+     {"crates/app": ""}, "crates/app", "workspace"),
+], ids=[
+    "exclude-beats-glob-member", "exclude-with-trailing-slash", "exclude-beats-nested-glob",
+    "nested-glob-sibling-is-member", "literal-member-beats-exclude", "unlisted-crate",
+    "no-members-unlisted-crate", "stray-crate", "path-dependency-of-member",
+    "missing-literal-member-breaks-workspace",
+])
+def test_cargo_workspace_membership_matches_cargo(tmp_path, root_manifest, crates, probe, expected):
+    _cargo_workspace(tmp_path, root_manifest, crates)
+    deps = MultiScanner().scan_file(str(tmp_path / probe / "Cargo.toml"))
+    assert [(dep.name, dep.version) for dep in deps if dep.name == "serde"] == [
+        ("serde", expected)
+    ]
+
+
+def test_scan_directory_keeps_member_dependency_when_root_manifest_is_ignored(tmp_path):
+    _cargo_workspace(tmp_path / "ws", '[workspace]\nmembers = ["crates/app"]\n', {"crates/app": ""})
+    (tmp_path / ".gitignore").write_text("/ws/Cargo.toml\n")
+    deps = MultiScanner().scan_directory(str(tmp_path))
+    assert [(dep.name, dep.version) for dep in deps] == [("serde", "1.0.190")]
+
+
+def test_scan_directory_tolerates_a_non_utf8_ancestor_manifest(tmp_path):
+    _cargo_workspace(tmp_path, '[workspace]\nmembers = ["crates/app"]\n', {"crates/app": ""})
+    with open(tmp_path / "Cargo.toml", "ab") as handle:
+        handle.write(b"\n# caf\xe9 latin-1 comment\n")
+    deps = MultiScanner().scan_directory(str(tmp_path))
+    assert [(dep.name, dep.version) for dep in deps] == [("serde", "1.0.190")]

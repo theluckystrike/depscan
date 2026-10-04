@@ -27,3 +27,12 @@ def test_list_deps_ecosystems_are_in_the_schema_enum(tmp_path):
     allowed = set(schema["items"]["properties"]["ecosystem"]["enum"])
     assert printed == {"cargo", "go", "npm", "pypi", "rubygems"}
     assert printed <= allowed
+
+
+def test_list_deps_schema_documents_the_cargo_workspace_marker(tmp_path):
+    (tmp_path / "Cargo.toml").write_text("[dependencies]\nserde = { workspace = true }\n")
+    result = CliRunner().invoke(cli, ["list-deps", "--json-output", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert [dep["version"] for dep in json.loads(result.output)] == ["workspace"]
+    schema = json.loads((SCHEMAS / "depscan-list-deps.json").read_text())
+    assert '"workspace"' in schema["items"]["properties"]["version"]["description"]
