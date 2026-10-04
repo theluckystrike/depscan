@@ -15,7 +15,7 @@
         "type": "object",
         "properties": {
           "name": { "type": "string", "description": "The dependency name as written in the manifest." },
-          "version": { "type": "string", "description": "Pinned version of the dependency." },
+          "version": { "type": "string", "description": "Pinned version of the dependency. A Cargo dependency declared with `workspace = true` whose version cannot be resolved from the workspace root is reported as the literal string \"workspace\", which is not a version number." },
           "target": { "type": "string", "description": "The well-known package name it appears to imitate." }
         },
         "required": ["name", "version", "target"]

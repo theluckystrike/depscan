@@ -175,7 +175,9 @@ class DependencyParser:
 
         Covers the dependency tables, their ``[target.<cfg>.*]`` variants and
         ``[workspace.dependencies]``. ``workspace = true`` takes its version from
-        this file's workspace table, else from *workspace_deps* (the root's).
+        this file's workspace table, else from *workspace_deps* (the root's); if
+        neither has the name, the version is the literal string "workspace".
+        Each (name, version) pair is reported once, as in parse_pyproject_toml.
         """
         try:
             data = tomllib.loads(content)
@@ -192,9 +194,12 @@ class DependencyParser:
         own_ws = workspace.get("dependencies") if isinstance(workspace, dict) else None
         own_ws = own_ws if isinstance(own_ws, dict) else {}
         tables.append(own_ws)
-        inherited = own_ws if isinstance(workspace, dict) else workspace_deps or {}
+        inherited = own_ws if isinstance(workspace, dict) else workspace_deps
+        if not isinstance(inherited, dict):
+            inherited = {}
 
         deps: list[Dependency] = []
+        seen: set[tuple[str, str]] = set()
         for section_data in tables:
             if not isinstance(section_data, dict):
                 continue
@@ -210,7 +215,8 @@ class DependencyParser:
                         version = base if isinstance(base, str) else "workspace"
                     elif isinstance(spec.get("version"), str):
                         version = spec["version"]
-                if version:
+                if version and (name, version) not in seen:
+                    seen.add((name, version))
                     deps.append(Dependency(
                         name=name,
                         version=version,
@@ -683,17 +689,39 @@ class DependencyParser:
         return deps
 
 
-def _cargo_workspace_deps(manifest: Path) -> dict | None:
-    """Return ``[workspace.dependencies]`` of the nearest enclosing workspace root."""
-    for directory in manifest.resolve().parent.parents:
+def _cargo_workspace_deps(manifest: Path, stop_at: Path | None = None) -> dict | None:
+    """Return ``[workspace.dependencies]`` of the workspace *manifest* belongs to.
+
+    Like Cargo, use the first ancestor ``[workspace]`` that does not ``exclude``
+    the package (an explicit ``members`` match wins over ``exclude``), but never
+    look above *stop_at*, the directory being scanned.
+    """
+    crate_dir = manifest.resolve().parent
+    stop = stop_at.resolve() if stop_at is not None else None
+    for directory in crate_dir.parents:
+        if stop is not None and directory != stop and stop not in directory.parents:
+            break
         try:
             data = tomllib.loads((directory / "Cargo.toml").read_text(encoding="utf-8"))
         except (OSError, tomllib.TOMLDecodeError):
             continue
         workspace = data.get("workspace")
-        if isinstance(workspace, dict):
-            deps = workspace.get("dependencies")
-            return deps if isinstance(deps, dict) else None
+        if not isinstance(workspace, dict):
+            continue
+        rel = crate_dir.relative_to(directory).as_posix()
+
+        def listed(key: str) -> bool:
+            entries = workspace.get(key)
+            return isinstance(entries, list) and any(
+                isinstance(entry, str)
+                and (fnmatch.fnmatch(rel, entry.rstrip("/")) or rel.startswith(entry.rstrip("/") + "/"))
+                for entry in entries
+            )
+
+        if listed("exclude") and not listed("members"):
+            continue
+        deps = workspace.get("dependencies")
+        return deps if isinstance(deps, dict) else None
     return None
 
 
@@ -742,8 +770,8 @@ class MultiScanner:
             "resque", "rspec", "nokogiri", "activerecord",
         ]
 
-    def scan_file(self, filepath: str) -> list[Dependency]:
-        """Scan a single dependency file."""
+    def scan_file(self, filepath: str, root: str | None = None) -> list[Dependency]:
+        """Scan a single dependency file; *root* bounds the Cargo workspace lookup."""
         content = Path(filepath).read_text(encoding="utf-8", errors="replace")
         path = Path(filepath)
 
@@ -753,7 +781,19 @@ class MultiScanner:
         if "cargo.lock" in filename:
             deps = self.parser.parse_cargo_lock(content)
         elif filename == "cargo.toml":
-            deps = self.parser.parse_cargo_toml(content, _cargo_workspace_deps(path))
+            stop_at = Path(root) if root is not None else None
+            workspace_deps = (
+                _cargo_workspace_deps(path, stop_at) if "workspace" in content else None
+            )
+            deps = self.parser.parse_cargo_toml(content, workspace_deps)
+            if root is not None and workspace_deps:
+                # The workspace root is inside the scan and reports these itself.
+                shared = {
+                    (name, spec if isinstance(spec, str) else spec.get("version"))
+                    for name, spec in workspace_deps.items()
+                    if isinstance(spec, (str, dict))
+                }
+                deps = [dep for dep in deps if (dep.name, dep.version) not in shared]
         elif "package-lock" in filename:
             deps = self.parser.parse_package_lock(content)
         elif filename == "package.json":
@@ -826,12 +866,12 @@ class MultiScanner:
                 files.append(path)
         return files
 
-    def _parse_all(self, paths: list[Path]) -> list[Dependency]:
+    def _parse_all(self, paths: list[Path], root: str | None = None) -> list[Dependency]:
         """Parse discovered files, skipping unreadable ones, then mark go.sum orphans."""
         deps: list[Dependency] = []
         for path in paths:
             try:
-                deps.extend(self.scan_file(str(path)))
+                deps.extend(self.scan_file(str(path), root))
             except OSError as exc:
                 warnings.warn(
                     f"Skipping unreadable dependency file {path}: {exc}",
@@ -865,7 +905,7 @@ class MultiScanner:
             include_hidden=include_hidden,
             respect_ignores=respect_ignores,
             exclude_patterns=exclude_patterns,
-        ))
+        ), root)
 
     def scan_directory_parallel(
         self,
@@ -885,7 +925,7 @@ class MultiScanner:
             exclude_patterns=exclude_patterns,
         )
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            parsed = executor.map(lambda path: self.scan_file(str(path)), paths)
+            parsed = executor.map(lambda path: self.scan_file(str(path), root), paths)
             return [dep for file_deps in parsed for dep in file_deps]
 
     def check_typosquat(self, dep: Dependency) -> bool:

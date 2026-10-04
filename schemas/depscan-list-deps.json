@@ -7,7 +7,7 @@
     "type": "object",
     "properties": {
       "name": { "type": "string", "description": "Dependency name." },
-      "version": { "type": "string", "description": "Pinned version from the lockfile or manifest." },
+      "version": { "type": "string", "description": "Pinned version from the lockfile or manifest. A Cargo dependency declared with `workspace = true` whose version cannot be resolved from the workspace root is reported as the literal string \"workspace\", which is not a version number." },
       "ecosystem": {
         "type": "string",
         "enum": ["cargo", "go", "npm", "pypi", "rubygems"],

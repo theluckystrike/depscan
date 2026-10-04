@@ -170,5 +170,5 @@ def test_list_deps_finds_cargo_workspace_dependencies(tmp_path):
     result = CliRunner().invoke(cli, ["list-deps", "--json-output", str(tmp_path)])
 
     assert result.exit_code == 0
-    found = {(d["name"], d["version"]) for d in json.loads(result.output)}
-    assert found == {("tokio", "1.37"), ("libc", "0.2"), ("tokio", "1.37.0")}
+    found = sorted((d["name"], d["version"]) for d in json.loads(result.output))
+    assert found == [("libc", "0.2"), ("tokio", "1.37"), ("tokio", "1.37.0")]

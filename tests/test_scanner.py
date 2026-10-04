@@ -654,10 +654,10 @@ exclude (
         scanner = MultiScanner()
         scan_file = scanner.scan_file
 
-        def read_or_fail(path):
+        def read_or_fail(path, *args):
             if Path(path) == bad:
                 raise PermissionError("denied")
-            return scan_file(path)
+            return scan_file(path, *args)
 
         with patch.object(scanner, "scan_file", side_effect=read_or_fail):
             with pytest.warns(RuntimeWarning, match="Skipping unreadable"):
@@ -1596,7 +1596,6 @@ log = { version = "0.4", optional = true }
         ("anyhow", "1.0"),
         ("log", "0.4"),
         ("serde", "1.0.200"),
-        ("serde", "1.0.200"),
     ]
 
 
@@ -1622,3 +1621,77 @@ def test_scan_file_resolves_workspace_versions_from_root_manifest(tmp_path):
         ("serde", "1.0.200"),
         ("missing", "workspace"),
     }
+
+
+def test_parse_cargo_toml_reports_each_name_and_version_once():
+    content = """
+[dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = { version = "0.2" }
+"""
+    deps = DependencyParser.parse_cargo_toml(content)
+    assert [(dep.name, dep.version) for dep in deps] == [("libc", "0.2")]
+
+
+@pytest.mark.parametrize("workspace_deps", [[["serde", "1.0"]], "notadict", 42])
+def test_parse_cargo_toml_ignores_non_dict_workspace_deps(workspace_deps):
+    deps = DependencyParser.parse_cargo_toml(
+        '[dependencies]\nserde = { workspace = true }\n', workspace_deps
+    )
+    assert [(dep.name, dep.version) for dep in deps] == [("serde", "workspace")]
+
+
+def test_scan_directory_counts_inherited_workspace_dependencies_once(tmp_path):
+    (tmp_path / "Cargo.toml").write_text(
+        '[workspace]\nmembers = ["crates/*"]\n\n'
+        '[workspace.dependencies]\nserde = "1.0.200"\n'
+    )
+    for index in range(5):
+        member = tmp_path / "crates" / f"c{index}"
+        member.mkdir(parents=True)
+        (member / "Cargo.toml").write_text(
+            f'[package]\nname = "c{index}"\nversion = "0.1.0"\n\n'
+            '[dependencies]\nserde = { workspace = true }\n'
+        )
+    deps = MultiScanner().scan_directory(str(tmp_path))
+    assert [(dep.name, dep.version) for dep in deps] == [("serde", "1.0.200")]
+
+
+def test_cargo_workspace_lookup_stops_at_the_scan_root(tmp_path):
+    (tmp_path / "Cargo.toml").write_text(
+        '[workspace]\n\n[workspace.dependencies]\nsneaky = "9.9.9"\n'
+    )
+    scanned = tmp_path / "unrelated" / "sub"
+    scanned.mkdir(parents=True)
+    (scanned / "Cargo.toml").write_text('[dependencies]\nsneaky = { workspace = true }\n')
+    deps = MultiScanner().scan_directory(str(scanned))
+    assert [(dep.name, dep.version) for dep in deps] == [("sneaky", "workspace")]
+
+
+def test_cargo_workspace_lookup_skips_a_workspace_that_excludes_the_package(tmp_path):
+    (tmp_path / "Cargo.toml").write_text(
+        '[workspace]\nmembers = ["crates/app"]\nexclude = ["crates/orphan"]\n\n'
+        '[workspace.dependencies]\nserde = "1.0.200"\n'
+    )
+    orphan = tmp_path / "crates" / "orphan"
+    orphan.mkdir(parents=True)
+    (orphan / "Cargo.toml").write_text('[dependencies]\nserde = { workspace = true }\n')
+    deps = MultiScanner().scan_file(str(orphan / "Cargo.toml"))
+    assert [(dep.name, dep.version) for dep in deps] == [("serde", "workspace")]
+
+
+def test_cargo_manifest_without_workspace_keys_skips_the_ancestor_lookup(tmp_path):
+    manifest = tmp_path / "Cargo.toml"
+    manifest.write_text('[dependencies]\nserde = "1.0"\n')
+    with patch("depscan.scanner._cargo_workspace_deps") as lookup:
+        deps = MultiScanner().scan_file(str(manifest))
+    lookup.assert_not_called()
+    assert [(dep.name, dep.version) for dep in deps] == [("serde", "1.0")]
