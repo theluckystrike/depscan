@@ -150,3 +150,25 @@ def test_fail_on_policies():
     assert _should_fail(typo, "vulnerable") is False
     assert _should_fail(vulnerable, "vulnerable") is True
     assert _should_fail(both, "any") is True
+
+
+def test_list_deps_finds_cargo_workspace_dependencies(tmp_path):
+    (tmp_path / "Cargo.toml").write_text(
+        '[workspace]\nmembers = ["app"]\n\n'
+        '[workspace.dependencies]\ntokio = "1.37"\n'
+    )
+    (tmp_path / "app").mkdir()
+    (tmp_path / "app" / "Cargo.toml").write_text(
+        '[package]\nname = "app"\nversion = "0.1.0"\n\n'
+        '[dependencies]\ntokio = { workspace = true }\n\n'
+        "[target.'cfg(unix)'.dependencies]\nlibc = \"0.2\"\n"
+    )
+    (tmp_path / "Cargo.lock").write_text(
+        '[[package]]\nname = "tokio"\nversion = "1.37.0"\n'
+        'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+    )
+    result = CliRunner().invoke(cli, ["list-deps", "--json-output", str(tmp_path)])
+
+    assert result.exit_code == 0
+    found = {(d["name"], d["version"]) for d in json.loads(result.output)}
+    assert found == {("tokio", "1.37"), ("libc", "0.2"), ("tokio", "1.37.0")}

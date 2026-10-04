@@ -170,16 +170,32 @@ class DependencyParser:
         return deps
 
     @staticmethod
-    def parse_cargo_toml(content: str) -> list[Dependency]:
-        """Parse dependency declarations from Cargo.toml."""
+    def parse_cargo_toml(content: str, workspace_deps: dict | None = None) -> list[Dependency]:
+        """Parse dependency declarations from Cargo.toml.
+
+        Covers the dependency tables, their ``[target.<cfg>.*]`` variants and
+        ``[workspace.dependencies]``. ``workspace = true`` takes its version from
+        this file's workspace table, else from *workspace_deps* (the root's).
+        """
         try:
             data = tomllib.loads(content)
         except (tomllib.TOMLDecodeError, TypeError):
             return []
 
+        sections = ("dependencies", "dev-dependencies", "build-dependencies")
+        tables = [data.get(section) for section in sections]
+        targets = data.get("target")
+        for target in targets.values() if isinstance(targets, dict) else ():
+            if isinstance(target, dict):
+                tables.extend(target.get(section) for section in sections)
+        workspace = data.get("workspace")
+        own_ws = workspace.get("dependencies") if isinstance(workspace, dict) else None
+        own_ws = own_ws if isinstance(own_ws, dict) else {}
+        tables.append(own_ws)
+        inherited = own_ws if isinstance(workspace, dict) else workspace_deps or {}
+
         deps: list[Dependency] = []
-        for section in ("dependencies", "dev-dependencies", "build-dependencies"):
-            section_data = data.get(section)
+        for section_data in tables:
             if not isinstance(section_data, dict):
                 continue
             for name, spec in section_data.items():
@@ -188,7 +204,10 @@ class DependencyParser:
                     version = spec
                 elif isinstance(spec, dict):
                     if spec.get("workspace") is True:
-                        version = "workspace"
+                        base = inherited.get(name)
+                        if isinstance(base, dict):
+                            base = base.get("version")
+                        version = base if isinstance(base, str) else "workspace"
                     elif isinstance(spec.get("version"), str):
                         version = spec["version"]
                 if version:
@@ -664,6 +683,20 @@ class DependencyParser:
         return deps
 
 
+def _cargo_workspace_deps(manifest: Path) -> dict | None:
+    """Return ``[workspace.dependencies]`` of the nearest enclosing workspace root."""
+    for directory in manifest.resolve().parent.parents:
+        try:
+            data = tomllib.loads((directory / "Cargo.toml").read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+        workspace = data.get("workspace")
+        if isinstance(workspace, dict):
+            deps = workspace.get("dependencies")
+            return deps if isinstance(deps, dict) else None
+    return None
+
+
 class MultiScanner:
     """Scan dependencies across multiple ecosystems."""
 
@@ -720,7 +753,7 @@ class MultiScanner:
         if "cargo.lock" in filename:
             deps = self.parser.parse_cargo_lock(content)
         elif filename == "cargo.toml":
-            deps = self.parser.parse_cargo_toml(content)
+            deps = self.parser.parse_cargo_toml(content, _cargo_workspace_deps(path))
         elif "package-lock" in filename:
             deps = self.parser.parse_package_lock(content)
         elif filename == "package.json":

@@ -1557,3 +1557,68 @@ class TestPackageNameValidation:
             # package name must appear in the argument list
             assert "lodash" in args[0]
         assert result == {"vulnerabilities": {}}
+
+
+def test_parse_cargo_toml_target_specific_sections():
+    content = '''
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winuser"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+nix = "0.28"
+
+[target.x86_64-unknown-linux-gnu.build-dependencies]
+pkg-config = "0.3"
+'''
+    deps = DependencyParser.parse_cargo_toml(content)
+    assert {(dep.name, dep.version) for dep in deps} == {
+        ("winapi", "0.3"),
+        ("nix", "0.28"),
+        ("pkg-config", "0.3"),
+    }
+
+
+def test_parse_cargo_toml_workspace_dependencies_and_inheritance():
+    content = '''
+[workspace]
+members = ["crates/*"]
+
+[workspace.dependencies]
+serde = { version = "1.0.200", features = ["derive"] }
+anyhow = "1.0"
+
+[dependencies]
+serde = { workspace = true, optional = true }
+log = { version = "0.4", optional = true }
+'''
+    deps = DependencyParser.parse_cargo_toml(content)
+    assert sorted((dep.name, dep.version) for dep in deps) == [
+        ("anyhow", "1.0"),
+        ("log", "0.4"),
+        ("serde", "1.0.200"),
+        ("serde", "1.0.200"),
+    ]
+
+
+def test_scan_file_resolves_workspace_versions_from_root_manifest(tmp_path):
+    (tmp_path / "Cargo.toml").write_text(
+        '[workspace]\nmembers = ["crates/app"]\n\n'
+        '[workspace.dependencies]\n'
+        'serde = { version = "1.0.200", features = ["derive"] }\n'
+        'anyhow = "1.0"\n'
+    )
+    member = tmp_path / "crates" / "app"
+    member.mkdir(parents=True)
+    (member / "Cargo.toml").write_text(
+        '[package]\nname = "app"\nversion = "0.1.0"\n\n'
+        '[dependencies]\n'
+        'anyhow.workspace = true\n'
+        'serde = { workspace = true, features = ["rc"] }\n'
+        'missing = { workspace = true }\n'
+    )
+    deps = MultiScanner().scan_file(str(member / "Cargo.toml"))
+    assert {(dep.name, dep.version) for dep in deps} == {
+        ("anyhow", "1.0"),
+        ("serde", "1.0.200"),
+        ("missing", "workspace"),
+    }
