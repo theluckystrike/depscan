@@ -184,12 +184,7 @@ class DependencyParser:
         except (tomllib.TOMLDecodeError, TypeError):
             return []
 
-        sections = ("dependencies", "dev-dependencies", "build-dependencies")
-        tables = [data.get(section) for section in sections]
-        targets = data.get("target")
-        for target in targets.values() if isinstance(targets, dict) else ():
-            if isinstance(target, dict):
-                tables.extend(target.get(section) for section in sections)
+        tables = _cargo_dependency_tables(data)
         workspace = data.get("workspace")
         own_ws = workspace.get("dependencies") if isinstance(workspace, dict) else None
         own_ws = own_ws if isinstance(own_ws, dict) else {}
@@ -689,39 +684,122 @@ class DependencyParser:
         return deps
 
 
-def _cargo_workspace_deps(manifest: Path, stop_at: Path | None = None) -> dict | None:
-    """Return ``[workspace.dependencies]`` of the workspace *manifest* belongs to.
+def _cargo_dependency_tables(data: dict) -> list:
+    """Return a manifest's dependency tables, including ``[target.<cfg>.*]`` ones."""
+    sections = ("dependencies", "dev-dependencies", "build-dependencies")
+    tables = [data.get(section) for section in sections]
+    targets = data.get("target")
+    for target in targets.values() if isinstance(targets, dict) else ():
+        if isinstance(target, dict):
+            tables.extend(target.get(section) for section in sections)
+    return tables
 
-    Like Cargo, use the first ancestor ``[workspace]`` that does not ``exclude``
-    the package (an explicit ``members`` match wins over ``exclude``), but never
-    look above *stop_at*, the directory being scanned.
+
+def _cargo_load(directory: Path) -> dict | None:
+    """Parse ``directory/Cargo.toml``; None if it is missing or unreadable."""
+    try:
+        text = (directory / "Cargo.toml").read_text(encoding="utf-8", errors="replace")
+        return tomllib.loads(text)
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+
+
+def _cargo_workspace_paths(workspace: dict, key: str) -> list[str]:
+    entries = workspace.get(key)
+    return [e for e in entries if isinstance(e, str)] if isinstance(entries, list) else []
+
+
+def _cargo_excluded(root: Path, workspace: dict, directory: Path) -> bool:
+    """Cargo's ``is_excluded``: under an ``exclude`` path and not under a literal
+    ``members`` path. A glob ``members`` entry never matches here, so
+    ``exclude`` wins over it."""
+    def under(entry: str) -> bool:
+        base = Path(os.path.normpath(root / entry))
+        return directory == base or base in directory.parents
+
+    return any(under(e) for e in _cargo_workspace_paths(workspace, "exclude")) and not any(
+        under(m) for m in _cargo_workspace_paths(workspace, "members")
+    )
+
+
+def _cargo_members(root: Path, data: dict) -> frozenset[Path]:
+    """The member directories of the workspace rooted at *root*.
+
+    Members are the root package, the directories matched by ``members``
+    (literal paths or globs), and the path dependencies of members that sit
+    inside the root, minus anything ``exclude`` removes. If one of them has
+    no readable Cargo.toml, Cargo rejects the whole workspace, so the set is
+    empty.
+    """
+    workspace = data["workspace"]
+    inherited = workspace.get("dependencies")
+    inherited = inherited if isinstance(inherited, dict) else {}
+    queue = [root] if isinstance(data.get("package"), dict) else []
+    for pattern in _cargo_workspace_paths(workspace, "members"):
+        if not any(char in pattern for char in "*?["):
+            queue.append(root / pattern)
+            continue
+        try:
+            queue.extend(match for match in root.glob(pattern.rstrip("/")) if match.is_dir())
+        except ValueError:
+            continue
+    found: set[Path] = set()
+    while queue:
+        directory = Path(os.path.normpath(queue.pop()))
+        if directory in found or _cargo_excluded(root, workspace, directory):
+            continue
+        if directory != root and root not in directory.parents:
+            continue
+        manifest = data if directory == root else _cargo_load(directory)
+        if manifest is None:
+            return frozenset()  # Cargo rejects a workspace with an unloadable member.
+        found.add(directory)
+        for table in _cargo_dependency_tables(manifest):
+            for name, spec in table.items() if isinstance(table, dict) else ():
+                base = directory
+                if isinstance(spec, dict) and spec.get("workspace") is True:
+                    spec, base = inherited.get(name), root
+                if isinstance(spec, dict) and isinstance(spec.get("path"), str):
+                    queue.append(base / spec["path"])
+    return frozenset(found)
+
+
+def _cargo_workspace_root(
+    manifest: Path, stop_at: Path | None = None, cache: dict | None = None
+) -> tuple[Path, dict] | None:
+    """Return the workspace root manifest and its ``[workspace.dependencies]``.
+
+    Follows Cargo: the root is the first ancestor whose ``[workspace]`` does not
+    exclude the package, and the package must be a member of it, otherwise
+    Cargo refuses to inherit. An ancestor Cargo.toml that cannot be parsed ends
+    the search, since Cargo stops there with an error too. The search never
+    goes above *stop_at*, the directory being scanned. *cache* keeps member
+    sets by root for the length of one directory scan.
     """
     crate_dir = manifest.resolve().parent
     stop = stop_at.resolve() if stop_at is not None else None
     for directory in crate_dir.parents:
         if stop is not None and directory != stop and stop not in directory.parents:
             break
-        try:
-            data = tomllib.loads((directory / "Cargo.toml").read_text(encoding="utf-8"))
-        except (OSError, tomllib.TOMLDecodeError):
+        if not (directory / "Cargo.toml").is_file():
             continue
+        data = _cargo_load(directory)
+        if data is None:
+            return None
         workspace = data.get("workspace")
         if not isinstance(workspace, dict):
             continue
-        rel = crate_dir.relative_to(directory).as_posix()
-
-        def listed(key: str) -> bool:
-            entries = workspace.get(key)
-            return isinstance(entries, list) and any(
-                isinstance(entry, str)
-                and (fnmatch.fnmatch(rel, entry.rstrip("/")) or rel.startswith(entry.rstrip("/") + "/"))
-                for entry in entries
-            )
-
-        if listed("exclude") and not listed("members"):
+        if _cargo_excluded(directory, workspace, crate_dir):
             continue
         deps = workspace.get("dependencies")
-        return deps if isinstance(deps, dict) else None
+        if not isinstance(deps, dict):
+            return None
+        members = cache.get(directory) if cache is not None else None
+        if members is None:
+            members = _cargo_members(directory, data)
+            if cache is not None:
+                cache[directory] = members
+        return (directory / "Cargo.toml", deps) if crate_dir in members else None
     return None
 
 
@@ -731,6 +809,7 @@ class MultiScanner:
     def __init__(self, strict: bool = False):
         self.parser = DependencyParser()
         self.strict = strict
+        self._cargo_members: dict[Path, frozenset[Path]] = {}
         self._typosquat_targets = self._load_typosquat_targets()
 
     def _validated(self, deps: list[Dependency]) -> list[Dependency]:
@@ -770,8 +849,15 @@ class MultiScanner:
             "resque", "rspec", "nokogiri", "activerecord",
         ]
 
-    def scan_file(self, filepath: str, root: str | None = None) -> list[Dependency]:
-        """Scan a single dependency file; *root* bounds the Cargo workspace lookup."""
+    def scan_file(
+        self, filepath: str, root: str | None = None, scanned: frozenset[Path] | None = None
+    ) -> list[Dependency]:
+        """Scan a single dependency file.
+
+        *root* bounds the Cargo workspace lookup. *scanned* is the set of resolved
+        files in the same scan; a Cargo member drops an inherited entry only when
+        its workspace root manifest is in that set and reports the entry itself.
+        """
         content = Path(filepath).read_text(encoding="utf-8", errors="replace")
         path = Path(filepath)
 
@@ -782,18 +868,22 @@ class MultiScanner:
             deps = self.parser.parse_cargo_lock(content)
         elif filename == "cargo.toml":
             stop_at = Path(root) if root is not None else None
-            workspace_deps = (
-                _cargo_workspace_deps(path, stop_at) if "workspace" in content else None
+            own_root = re.search(r"^\s*\[workspace[\].]", content, re.MULTILINE)
+            found = (
+                _cargo_workspace_root(
+                    path, stop_at, self._cargo_members if scanned is not None else None
+                )
+                if "workspace" in content and not own_root else None
             )
-            deps = self.parser.parse_cargo_toml(content, workspace_deps)
-            if root is not None and workspace_deps:
-                # The workspace root is inside the scan and reports these itself.
-                shared = {
-                    (name, spec if isinstance(spec, str) else spec.get("version"))
-                    for name, spec in workspace_deps.items()
-                    if isinstance(spec, (str, dict))
+            deps = self.parser.parse_cargo_toml(content, found[1] if found else None)
+            if found and scanned is not None and found[0] in scanned:
+                reported = {
+                    (dep.name, dep.version)
+                    for dep in self.parser.parse_cargo_toml(
+                        found[0].read_text(encoding="utf-8", errors="replace")
+                    )
                 }
-                deps = [dep for dep in deps if (dep.name, dep.version) not in shared]
+                deps = [dep for dep in deps if (dep.name, dep.version) not in reported]
         elif "package-lock" in filename:
             deps = self.parser.parse_package_lock(content)
         elif filename == "package.json":
@@ -869,9 +959,11 @@ class MultiScanner:
     def _parse_all(self, paths: list[Path], root: str | None = None) -> list[Dependency]:
         """Parse discovered files, skipping unreadable ones, then mark go.sum orphans."""
         deps: list[Dependency] = []
+        scanned = frozenset(path.resolve() for path in paths)
+        self._cargo_members = {}
         for path in paths:
             try:
-                deps.extend(self.scan_file(str(path), root))
+                deps.extend(self.scan_file(str(path), root, scanned))
             except OSError as exc:
                 warnings.warn(
                     f"Skipping unreadable dependency file {path}: {exc}",
@@ -924,8 +1016,10 @@ class MultiScanner:
             respect_ignores=respect_ignores,
             exclude_patterns=exclude_patterns,
         )
+        scanned = frozenset(path.resolve() for path in paths)
+        self._cargo_members = {}
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            parsed = executor.map(lambda path: self.scan_file(str(path), root), paths)
+            parsed = executor.map(lambda path: self.scan_file(str(path), root, scanned), paths)
             return [dep for file_deps in parsed for dep in file_deps]
 
     def check_typosquat(self, dep: Dependency) -> bool:

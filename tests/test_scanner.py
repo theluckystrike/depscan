@@ -1691,7 +1691,73 @@ def test_cargo_workspace_lookup_skips_a_workspace_that_excludes_the_package(tmp_
 def test_cargo_manifest_without_workspace_keys_skips_the_ancestor_lookup(tmp_path):
     manifest = tmp_path / "Cargo.toml"
     manifest.write_text('[dependencies]\nserde = "1.0"\n')
-    with patch("depscan.scanner._cargo_workspace_deps") as lookup:
+    with patch("depscan.scanner._cargo_workspace_root") as lookup:
         deps = MultiScanner().scan_file(str(manifest))
     lookup.assert_not_called()
     assert [(dep.name, dep.version) for dep in deps] == [("serde", "1.0")]
+
+
+def _cargo_workspace(base, root_manifest, crates):
+    """Write a workspace root plus member crates that inherit serde."""
+    base.mkdir(parents=True, exist_ok=True)
+    (base / "Cargo.toml").write_text(
+        root_manifest + '\n[workspace.dependencies]\nserde = "1.0.190"\n'
+    )
+    for rel, extra in crates.items():
+        crate = base / rel
+        crate.mkdir(parents=True, exist_ok=True)
+        (crate / "Cargo.toml").write_text(
+            f'[package]\nname = "{crate.name}"\nversion = "0.1.0"\n\n'
+            '[dependencies]\nserde = { workspace = true }\n' + extra
+        )
+
+
+# Expected versions were checked against `cargo metadata --no-deps` (cargo 1.96).
+@pytest.mark.parametrize("root_manifest, crates, probe, expected", [
+    ('[workspace]\nmembers = ["crates/*"]\nexclude = ["crates/foo"]\n',
+     {"crates/app": "", "crates/foo": ""}, "crates/foo", "workspace"),
+    ('[workspace]\nmembers = ["crates/*"]\nexclude = ["crates/foo/"]\n',
+     {"crates/foo": ""}, "crates/foo", "workspace"),
+    ('[workspace]\nmembers = ["a/b/*"]\nexclude = ["a/b/c"]\n',
+     {"a/b/c": "", "a/b/d": ""}, "a/b/c", "workspace"),
+    ('[workspace]\nmembers = ["a/b/*"]\nexclude = ["a/b/c"]\n',
+     {"a/b/c": "", "a/b/d": ""}, "a/b/d", "1.0.190"),
+    ('[workspace]\nmembers = ["crates/foo"]\nexclude = ["crates/foo"]\n',
+     {"crates/foo": "", "crates/bar": ""}, "crates/foo", "1.0.190"),
+    ('[workspace]\nmembers = ["crates/foo"]\nexclude = ["crates/foo"]\n',
+     {"crates/foo": "", "crates/bar": ""}, "crates/bar", "workspace"),
+    ('[workspace]\nexclude = ["crates/foo"]\n\n[package]\nname = "root"\nversion = "0.1.0"\n',
+     {"crates/foo": "", "crates/bar": ""}, "crates/bar", "workspace"),
+    ('[workspace]\nmembers = ["crates/app"]\n',
+     {"crates/app": "", "crates/stray": ""}, "crates/stray", "workspace"),
+    ('[workspace]\nmembers = ["crates/app"]\n',
+     {"crates/app": 'lib = { path = "../lib" }\n', "crates/lib": ""}, "crates/lib", "1.0.190"),
+    ('[workspace]\nmembers = ["crates/*", "crates/gone"]\n',
+     {"crates/app": ""}, "crates/app", "workspace"),
+], ids=[
+    "exclude-beats-glob-member", "exclude-with-trailing-slash", "exclude-beats-nested-glob",
+    "nested-glob-sibling-is-member", "literal-member-beats-exclude", "unlisted-crate",
+    "no-members-unlisted-crate", "stray-crate", "path-dependency-of-member",
+    "missing-literal-member-breaks-workspace",
+])
+def test_cargo_workspace_membership_matches_cargo(tmp_path, root_manifest, crates, probe, expected):
+    _cargo_workspace(tmp_path, root_manifest, crates)
+    deps = MultiScanner().scan_file(str(tmp_path / probe / "Cargo.toml"))
+    assert [(dep.name, dep.version) for dep in deps if dep.name == "serde"] == [
+        ("serde", expected)
+    ]
+
+
+def test_scan_directory_keeps_member_dependency_when_root_manifest_is_ignored(tmp_path):
+    _cargo_workspace(tmp_path / "ws", '[workspace]\nmembers = ["crates/app"]\n', {"crates/app": ""})
+    (tmp_path / ".gitignore").write_text("/ws/Cargo.toml\n")
+    deps = MultiScanner().scan_directory(str(tmp_path))
+    assert [(dep.name, dep.version) for dep in deps] == [("serde", "1.0.190")]
+
+
+def test_scan_directory_tolerates_a_non_utf8_ancestor_manifest(tmp_path):
+    _cargo_workspace(tmp_path, '[workspace]\nmembers = ["crates/app"]\n', {"crates/app": ""})
+    with open(tmp_path / "Cargo.toml", "ab") as handle:
+        handle.write(b"\n# caf\xe9 latin-1 comment\n")
+    deps = MultiScanner().scan_directory(str(tmp_path))
+    assert [(dep.name, dep.version) for dep in deps] == [("serde", "1.0.190")]
